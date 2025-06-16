@@ -1,0 +1,4 @@
+torch==2.7.1+cu118
+torchvision==0.22.1+cu118
+peft==0.15.2
+timm==0.6.12
