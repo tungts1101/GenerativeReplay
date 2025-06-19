@@ -5,6 +5,7 @@ from .base import BaseTrainer
 from network.base import BaseNet
 import logging
 from utils.base import Config, weight_init, freeze_model, count_parameters
+from torch.nn.utils import spectral_norm
 import copy
 import os
 
@@ -17,9 +18,11 @@ class Generator(nn.Module):
         self.feature_dim = config.generative_feature_dim
         self.model = nn.Sequential(
             nn.Linear(self.latent_dim, self.hidden_dim),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LayerNorm(self.hidden_dim),
+            nn.ReLU(inplace=True),
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LayerNorm(self.hidden_dim),
+            nn.ReLU(inplace=True),
             nn.Linear(self.hidden_dim, self.feature_dim),
         )
         self.apply(weight_init)
@@ -38,13 +41,13 @@ class Discriminator(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.feature_dim = config.generative_feature_dim
-        self.hidden_dim = config.generative_hidden_dim
+        self.hidden_dim = config.discriminator_hidden_dim
         self.total_classes = config.generative_num_classes
 
         self.model = nn.Sequential(
-            nn.Linear(self.feature_dim, self.hidden_dim),
+            spectral_norm(nn.Linear(self.feature_dim, self.hidden_dim)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+            spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),
             nn.LeakyReLU(0.2, inplace=True),
         )
         self.valid = nn.Linear(self.hidden_dim, 1)
@@ -125,6 +128,9 @@ def compute_gradient_penalty(D, real_feat, fake_feat, y_onehot):
 class FeatureGeneratorTrainer(BaseTrainer):
     def backbone_path(self, task=-1):
         return "checkpoints/backbone" + (".pth" if task == -1 else f"_{task}.pth")
+    
+    def cls_path(self, task=-1):
+        return "checkpoints/cls" + (".pth" if task == -1 else f"_{task}.pth")
 
     def pre_train(self):
         torch.save(self.net.get_backbone_trainable_params(), self.backbone_path(-1))
@@ -147,7 +153,8 @@ class FeatureGeneratorTrainer(BaseTrainer):
         if self.cur_task == 0:
             generative_config = {
                 "generative_latent_dim": generative_latent_dim,
-                "generative_hidden_dim": 512,
+                "generative_hidden_dim": 1024,
+                "discriminator_hidden_dim": 512,
                 "generative_feature_dim": self.net.backbone.out_dim,
                 "generative_num_classes": total_num_classes,
             }
@@ -170,7 +177,7 @@ class FeatureGeneratorTrainer(BaseTrainer):
         discriminator.eval()
 
         # Step 1: Optimize the backbone and classifier on current task dataset
-        if not os.path.exists(self.backbone_path(self.cur_task)):
+        if not os.path.exists(self.backbone_path(self.cur_task)) or not os.path.exists(self.cls_path(self.cur_task)):
             task_net = BaseNet(self.config)
             task_net.classifier.update(num_classes)
             task_net.backbone.load_state_dict(self.net.backbone.state_dict())
@@ -181,12 +188,11 @@ class FeatureGeneratorTrainer(BaseTrainer):
                 f"Task model trainable parameters: {task_net_parameters['trainable_params']}, Total parameters: {task_net_parameters['total_params']}"
             )
 
-            optimizer = optim.SGD(
-                task_net.parameters(), lr=1e-2, momentum=0.9, weight_decay=5e-4
-            )
+            optimizer = optim.SGD(task_net.parameters(), lr=1e-2, momentum=0.9, weight_decay=5e-4)
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0.0)
             for epoch in range(epochs):
                 total_loss = 0.0
+                total_acc = 0.0
                 for i, batch in enumerate(self.train_loader):
                     _, samples, targets = batch
                     samples, targets = samples.to(self.device), targets.to(self.device)
@@ -200,40 +206,45 @@ class FeatureGeneratorTrainer(BaseTrainer):
                     optimizer.step()
 
                     total_loss += loss.item()
+                    preds = outputs.argmax(dim=1)
+                    total_acc += (preds == targets).sum().item()
 
                 scheduler.step()
 
                 avg_loss = total_loss / len(self.train_loader)
-                logging.info(f"Epoch [{epoch + 1}/{epochs}], Loss: {avg_loss:.4f}")
+                avg_acc = total_acc / len(self.train_loader.dataset)
+                logging.info(f"Epoch [{epoch + 1}/{epochs}], Loss: {avg_loss:.4f}, Accuracy: {avg_acc:.4f}")
 
             task_net.cpu()
             torch.save(
                 task_net.get_backbone_trainable_params(), self.backbone_path(self.cur_task)
             )
-            self.net.classifier.update(num_classes, freeze_old=False)
-            self.net.classifier.classifiers[-1].load_state_dict(
-                task_net.classifier.classifiers[-1].state_dict(), strict=True
+            torch.save(
+                task_net.classifier.classifiers[-1].state_dict(), self.cls_path(self.cur_task)
             )
-            self.net.classifier.to(self.device)
             del task_net
 
         self.merge()
+        self.net.eval()
 
         # Step 2: Optimize the generator and discriminator
-        if os.path.exists(f"checkpoints/generator_{self.cur_task}.pth") and os.path.exists(f"checkpoints/discriminator_{self.cur_task}.pth"):
+        if (os.path.exists(f"checkpoints/generator_{self.cur_task}.pth") and os.path.exists(f"checkpoints/discriminator_{self.cur_task}.pth")) and False:
             generator.load_state_dict(torch.load(f"checkpoints/generator_{self.cur_task}.pth"))
             discriminator.load_state_dict(torch.load(f"checkpoints/discriminator_{self.cur_task}.pth"))
         else:
-            optimizer_G = optim.AdamW(generator.parameters(), lr=1e-4)
-            optimizer_D = optim.AdamW(discriminator.parameters(), lr=1e-4)
-            scheduler_G = optim.lr_scheduler.CosineAnnealingLR(optimizer_G, T_max=epochs, eta_min=0.0)
-            scheduler_D = optim.lr_scheduler.CosineAnnealingLR(optimizer_D, T_max=epochs, eta_min=0.0)
-
+            train_generative_epochs = 50
+            num_critic = 3
             lambda_gp = 10.0
-            lambda_d_cls = 10.0
+            lambda_d_cls = 5.0
             lambda_g_cls = 1.0
+            lambda_g_aug = 10.0
 
-            for epoch in range(50):
+            optimizer_G = optim.Adam(generator.parameters(), lr=2e-4, betas=(0.0, 0.9))
+            optimizer_D = optim.Adam(discriminator.parameters(), lr=5e-5, betas=(0.0, 0.9))
+            scheduler_G = optim.lr_scheduler.CosineAnnealingLR(optimizer_G, T_max=train_generative_epochs, eta_min=0.0)
+            scheduler_D = optim.lr_scheduler.CosineAnnealingLR(optimizer_D, T_max=train_generative_epochs, eta_min=0.0)
+
+            for epoch in range(train_generative_epochs):
                 loss_log = {
                     'D/loss': 0.0,
                     'D/new_rf': 0.0,
@@ -242,6 +253,7 @@ class FeatureGeneratorTrainer(BaseTrainer):
                     'G/loss': 0.0,
                     'G/new_rf': 0.0,
                     'G/new_cls': 0.0,
+                    'G/new_aug': 0.0,
                 }
 
                 for i, batch in enumerate(self.train_loader):
@@ -253,58 +265,74 @@ class FeatureGeneratorTrainer(BaseTrainer):
                     generator.eval()
                     discriminator.train()
 
-                    real_feat = self.net.backbone(samples)
-                    
+                    for _ in range(num_critic):
+                        z = torch.randn(B, generative_latent_dim, device=self.device)
+                        y_onehot = F.one_hot(targets, num_classes=total_num_classes).float()
+
+                        with torch.no_grad():
+                            real_feat = self.net.backbone(samples)
+                            fake_feat = generator(z, y_onehot)
+
+                        fake_validity, _ = discriminator(fake_feat, y_onehot)
+                        real_validity, disc_real_acgan = discriminator(real_feat, y_onehot)
+
+                        d_loss_rf = -torch.mean(real_validity) + torch.mean(fake_validity)
+                        d_loss_cls = F.cross_entropy(disc_real_acgan, targets)
+                        gradient_penalty = compute_gradient_penalty(discriminator, real_feat, fake_feat, y_onehot).mean()
+                        d_loss = d_loss_rf + lambda_gp * gradient_penalty + lambda_d_cls * d_loss_cls
+                        # d_loss = d_loss_rf + lambda_d_cls * d_loss_cls
+
+                        optimizer_D.zero_grad()
+                        d_loss.backward()
+                        optimizer_D.step()
+
+                        loss_log['D/loss'] += d_loss.item()
+                        loss_log['D/new_rf'] += d_loss_rf.item()
+                        loss_log['D/new_cls'] += d_loss_cls.item() if lambda_d_cls != 0 else 0
+                        loss_log['D/new_gp'] += gradient_penalty.item() if lambda_gp != 0 else 0
+
+                    # train generator
+                    discriminator.eval()
+                    generator.train()
+
                     z = torch.randn(B, generative_latent_dim, device=self.device)
                     y_onehot = F.one_hot(targets, num_classes=total_num_classes).float()
 
                     fake_feat = generator(z, y_onehot)
-                    fake_validity, _ = discriminator(fake_feat, y_onehot)
-                    real_validity, disc_real_acgan = discriminator(real_feat, y_onehot)
+                    fake_validity, disc_fake_acgan = discriminator(fake_feat, y_onehot)
 
-                    d_loss_rf = -torch.mean(real_validity) + torch.mean(fake_validity)
-                    d_loss_cls = F.cross_entropy(disc_real_acgan, targets)
-                    gradient_penalty = compute_gradient_penalty(discriminator, real_feat, fake_feat, y_onehot).mean()
-                    d_loss = d_loss_rf + lambda_gp * gradient_penalty + lambda_d_cls * d_loss_cls
+                    g_loss_rf = -torch.mean(fake_validity)
+                    g_loss_cls = F.cross_entropy(disc_fake_acgan, targets)
 
-                    optimizer_D.zero_grad()
-                    d_loss.backward()
-                    optimizer_D.step()
+                    if self.cur_task == 0:
+                        loss_aug = torch.tensor(0.0, device=self.device)
+                    else:
+                        aug_B = 256
+                        prev_z = torch.randn(aug_B, generative_latent_dim, device=self.device)
+                        prev_y = torch.randint(0, self.known_classes, (aug_B,), device=self.device)
+                        prev_y_onehot = F.one_hot(prev_y, num_classes=total_num_classes).float()
 
-                    loss_log['D/loss'] += d_loss.item()
-                    loss_log['D/new_rf'] += d_loss_rf.item()
-                    loss_log['D/new_cls'] += d_loss_cls.item() if lambda_d_cls != 0 else 0
-                    loss_log['D/new_gp'] += gradient_penalty.item() if lambda_gp != 0 else 0
+                        with torch.no_grad():
+                            pre_feat = generator_old(prev_z, prev_y_onehot)
+                        cur_feat = generator(prev_z, prev_y_onehot)
+                        loss_aug = F.mse_loss(cur_feat, pre_feat)
 
-                    if i % 2 == 0:
-                        # train generator
-                        discriminator.eval()
-                        generator.train()
+                    g_loss = g_loss_rf + lambda_g_cls * g_loss_cls + lambda_g_aug * loss_aug
 
-                        z = torch.randn(B, generative_latent_dim, device=self.device)
-                        y_onehot = F.one_hot(targets, num_classes=total_num_classes).float()
+                    loss_log['G/loss'] += g_loss.item()
+                    loss_log['G/new_rf'] += g_loss_rf.item()
+                    loss_log['G/new_cls'] += g_loss_cls.item() if lambda_g_cls != 0 else 0
+                    loss_log['G/new_aug'] = loss_aug.item() if lambda_g_aug != 0 else 0
 
-                        fake_feat = generator(z, y_onehot)
-                        fake_validity, disc_fake_acgan = discriminator(fake_feat, y_onehot)
-
-                        g_loss_rf = -torch.mean(fake_validity)
-                        g_loss_cls = F.cross_entropy(disc_fake_acgan, targets)
-                        g_loss = g_loss_rf + lambda_g_cls * g_loss_cls
-
-                        loss_log['G/loss'] += g_loss.item()
-                        loss_log['G/new_rf'] += g_loss_rf.item()
-                        loss_log['G/new_cls'] += g_loss_cls.item() if lambda_g_cls != 0 else 0
-
-                        optimizer_G.zero_grad()
-                        g_loss.backward()
-                        optimizer_G.step()
-
+                    optimizer_G.zero_grad()
+                    g_loss.backward()
+                    optimizer_G.step()
+                    
+                # scheduler_D.step()
+                # scheduler_G.step()
                 for key in loss_log:
                     loss_log[key] /= len(self.train_loader)
-                logging.info(f"Loss Log: {loss_log}")
-
-                scheduler_G.step()
-                scheduler_D.step()
+                logging.info(f"Epoch [{epoch + 1}/{train_generative_epochs}], Loss Log: {loss_log}")
             
             torch.save(generator.state_dict(), f"checkpoints/generator_{self.cur_task}.pth")
             torch.save(discriminator.state_dict(), f"checkpoints/discriminator_{self.cur_task}.pth")
@@ -312,6 +340,11 @@ class FeatureGeneratorTrainer(BaseTrainer):
         # Step 3: Optimize the classifiers with the generated features
         generator.eval()
         discriminator.eval()
+        self.net.train()
+
+        self.net.classifier.update(num_classes, freeze_old=False)
+        self.net.classifier.classifiers[-1].load_state_dict(torch.load(self.cls_path(self.cur_task)), strict=True)
+        self.net.classifier.to(self.device)
 
         classifier_params = {
             "trainable_params": count_parameters(self.net.classifier, trainble=True),
@@ -320,24 +353,23 @@ class FeatureGeneratorTrainer(BaseTrainer):
         logging.info(
             f"Classifier trainable parameters: {classifier_params['trainable_params']}, Total parameters: {classifier_params['total_params']}"
         )
-        optimizer_C = optim.AdamW(self.net.classifier.parameters(), lr=1e-4)
+        optimizer_C = optim.SGD(self.net.classifier.parameters(), lr=1e-2, momentum=0.9, weight_decay=5e-4)
         scheduler_C = optim.lr_scheduler.CosineAnnealingLR(optimizer_C, T_max=epochs, eta_min=0.0)
 
-        for epoch in range(10):
+        generative_classifier_epochs = 20
+        for epoch in range(generative_classifier_epochs):
             total_loss = 0.0
-            step = 500
+            step = 1000
+            B = 128
 
             for i in range(step):
-                B = 64
                 labels      = torch.randint(0, self.total_classes, (B,), device=self.device)
                 y_onehot    = F.one_hot(labels, total_num_classes).float()
                 z           = torch.randn(B, generative_latent_dim, device=self.device)
 
-                # 2) generate synthetic features (no grad for G)
                 with torch.no_grad():
                     synth_feat = generator(z, y_onehot)
 
-                # 3) train classifier on synthetic pair (feat, label)
                 logits = self.net.classifier(synth_feat)['logits']
                 loss   = F.cross_entropy(logits, labels)
 
@@ -350,6 +382,6 @@ class FeatureGeneratorTrainer(BaseTrainer):
             scheduler_C.step()
 
             avg_loss = total_loss / step
-            logging.info(f"Epoch [{epoch + 1}/10], Classifier Loss: {avg_loss:.4f}")
+            logging.info(f"Epoch [{epoch + 1}/{generative_classifier_epochs}], Classifier Loss: {avg_loss:.4f}")
 
             

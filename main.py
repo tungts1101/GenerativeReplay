@@ -2,6 +2,7 @@ from dataset.data import DataManager
 from network.base import BaseNet
 from training.simple_trainer import SimpleTrainer
 from training.feature_generator_trainer import FeatureGeneratorTrainer
+from training.vae_trainer import VaeTrainer
 import logging
 import sys
 from utils.base import Config
@@ -17,7 +18,7 @@ parsed_config = {
 
     "net_backbone_name": "vit_base_patch16_224_lora",
 
-    "training_epochs": 1,
+    "training_epochs": 10,
 }
 
 
@@ -35,5 +36,6 @@ if __name__ == "__main__":
     config.data_manager = data_manager
     config.net = BaseNet(config)
 
-    trainer = FeatureGeneratorTrainer(config)
+    # trainer = FeatureGeneratorTrainer(config)
+    trainer = VaeTrainer(config)
     trainer.run()
